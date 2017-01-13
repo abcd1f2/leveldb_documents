@@ -1196,8 +1196,11 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
   w.sync = options.sync;
   w.done = false;
 
+  //会锁第一次
   MutexLock l(&mutex_);
+  //加入到写操作队列中
   writers_.push_back(&w);
+  //这里先判断是否完成，是每次写的时候有个优化，每次都会取一批batch出来写，各自的状态置为完成状态
   while (!w.done && &w != writers_.front()) {
     w.cv.Wait();
   }
@@ -1206,10 +1209,15 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
   }
 
   // May temporarily unlock and wait.
+  //尝试给出空间给后面需要的write使用，里面判断条件比较多
   Status status = MakeRoomForWrite(my_batch == NULL);
+  //这里会从取到一个最大的序列号，供后面使用
   uint64_t last_sequence = versions_->LastSequence();
+  
   Writer* last_writer = &w;
+  
   if (status.ok() && my_batch != NULL) {  // NULL batch is for compactions
+	//这里进行了优化，会取出一批batch一次性写入
     WriteBatch* updates = BuildBatchGroup(&last_writer);
     WriteBatchInternal::SetSequence(updates, last_sequence + 1);
     last_sequence += WriteBatchInternal::Count(updates);
@@ -1219,6 +1227,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
     // and protects against concurrent loggers and concurrent writes
     // into mem_.
     {
+	  //当前面退出时，MutexLock析构时候直接解锁，这里是主动解锁，避免锁定时间太长
       mutex_.Unlock();
       status = log_->AddRecord(WriteBatchInternal::Contents(updates));
       bool sync_error = false;
@@ -1276,6 +1285,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   // Allow the group to grow up to a maximum size, but if the
   // original write is small, limit the growth so we do not slow
   // down the small write too much.
+  //max_size 最大为1m或者256k
   size_t max_size = 1 << 20;
   if (size <= (128<<10)) {
     max_size = size + (128<<10);
@@ -1288,6 +1298,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
     Writer* w = *iter;
     if (w->sync && !first->sync) {
       // Do not include a sync write into a batch handled by a non-sync write.
+	  //当遇到一个是同步写的也会退出
       break;
     }
 
@@ -1295,6 +1306,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
       size += WriteBatchInternal::ByteSize(w->batch);
       if (size > max_size) {
         // Do not make batch too big
+		//当总的batch的字节数操作max_size,退出
         break;
       }
 
@@ -1305,6 +1317,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
         assert(WriteBatchInternal::Count(result) == 0);
         WriteBatchInternal::Append(result, first->batch);
       }
+	  //将w的batch加入到result中，组成一个更大的batch
       WriteBatchInternal::Append(result, w->batch);
     }
     *last_writer = w;
