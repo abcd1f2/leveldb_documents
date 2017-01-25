@@ -56,16 +56,36 @@ extern bool SomeFileOverlapsRange(
     const Slice* smallest_user_key,
     const Slice* largest_user_key);
 
+/*
+对于同一笔记录，如果读和写同一时间发生，reader可能读到不一致的数据或者是修改了一半的数据。对于这种情况，有三种常见的解决方法：
+    1.悲观锁   最简单的处理方式，就是加锁保护，写的时候不许读，读的时候不许写。效率低。
+
+    2.乐观锁   它假设多用户并发的事物在处理时不会彼此互相影响，各食物能够在不产生锁的的情况下处理各自影响的那部分数据。
+    在提交数据更新之前，每个事务会先检查在该事务读取数据后，有没有其他事务又修改了该数据。
+    如果其他事务有更新的话，正在提交的事务会进行回滚;这样做不会有锁竞争更不会产生死锁，
+    但如果数据竞争的概率较高，效率也会受影响 。
+
+    3.MVCC    MVCC是一个数据库常用的概念。Multiversion concurrency control多版本并发控制。每一个执行操作的用户，
+    看到的都是数据库特定时刻的的快照(snapshot), writer的任何未完成的修改都不会被其他的用户所看到;
+    当对数据进行更新的时候并是不直接覆盖，而是先进行标记, 然后在其他地方添加新的数据，从而形成一个新版本,
+    此时再来读取的reader看到的就是最新的版本了。所以这种处理策略是维护了多个版本的数据的,但只有一个是最新的。
+
+sstable级别的MVCC就是利用Version实现的。
+    1.只有一个current version，持有最新的sstable集合。
+    2.VersionEdit 代表一次更新，新增了哪些sstable file，以及删除了哪些sstable file
+*/
 class Version {
  public:
   // Append to *iters a sequence of iterators that will
   // yield the contents of this Version when merged together.
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
+  // 生成iterator用于遍历 
   void AddIterators(const ReadOptions&, std::vector<Iterator*>* iters);
 
   // Lookup the value for key.  If found, store it in *val and
   // return OK.  Else return a non-OK status.  Fills *stats.
   // REQUIRES: lock is not held
+  // 根据key来查询，若没有查到，更新GetStats 
   struct GetStats {
     FileMetaData* seek_file;
     int seek_file_level;
@@ -76,6 +96,7 @@ class Version {
   // Adds "stats" into the current state.  Returns true if a new
   // compaction may need to be triggered, false otherwise.
   // REQUIRES: lock is held
+  // 是否需要进行compaction 
   bool UpdateStats(const GetStats& stats);
 
   // Record a sample of bytes read at the specified internal key.
@@ -86,9 +107,11 @@ class Version {
 
   // Reference count management (so Versions do not disappear out from
   // under live iterators)
+  // 引用计算，避免在被引用时候删除 
   void Ref();
   void Unref();
 
+  // 查询和key range有关的files 
   void GetOverlappingInputs(
       int level,
       const InternalKey* begin,         // NULL means before all keys
@@ -99,15 +122,27 @@ class Version {
   // some part of [*smallest_user_key,*largest_user_key].
   // smallest_user_key==NULL represents a key smaller than all keys in the DB.
   // largest_user_key==NULL represents a key largest than all keys in the DB.
+  /*
+  在处理level-0时，采用感染的方法扩大compact的文件的范围。因为level-0的文件较小，compact的时候会相对快一些。
+  使得对level-0的compact更为彻底。这里并没有使用lazy的思想，反而是像打了一针兴奋剂一样，将level-0的处理提前了。eager的思想。
+  计算是否level对某个key range是否有overlap
+  */
   bool OverlapInLevel(int level,
                       const Slice* smallest_user_key,
                       const Slice* largest_user_key);
 
   // Return the level at which we should place a new memtable compaction
   // result that covers the range [smallest_user_key,largest_user_key].
+  /*
+      merge时的优化：
+      尽量将文件放入到高层，但是又不能让这层跟它的parent有太多的重叠
+      memtable output应该放到哪个level
+      该函数用来选择  需要将从MemTable dump出的sstable file放入第几层
+  */
   int PickLevelForMemTableOutput(const Slice& smallest_user_key,
                                  const Slice& largest_user_key);
 
+    //某个level的文件个数 
   int NumFiles(int level) const { return files_[level].size(); }
 
   // Return a human readable string that describes this version's contents.
@@ -129,21 +164,30 @@ class Version {
                           void* arg,
                           bool (*func)(void*, int, FileMetaData*));
 
+  //所有的version都属于一个集合即Version Set
   VersionSet* vset_;            // VersionSet to which this Version belongs
+  
+  //VersionSet是Version组成的双链表，因此Version需要记录前一个Version和后一个Version
   Version* next_;               // Next version in linked list
   Version* prev_;               // Previous version in linked list
   int refs_;                    // Number of live refs to this version
 
   // List of files per level
+  //该version下的所有level的所有sstable文件，每个文件由FileMetaData表示
   std::vector<FileMetaData*> files_[config::kNumLevels];
 
   // Next file to compact based on seek stats.
+  // 下一个要被compaction的文件 
   FileMetaData* file_to_compact_;
   int file_to_compact_level_;
 
   // Level that should be compacted next and its compaction score.
   // Score < 1 means compaction is not strictly needed.  These fields
   // are initialized by Finalize().
+  /*
+      Compaction需要用compaction_score_来判断是否需要发起major compaction
+      这部分逻辑与某level所有SSTable file的大小有关系
+  */
   double compaction_score_;
   int compaction_level_;
 
@@ -161,6 +205,13 @@ class Version {
   Version(const Version&);
   void operator=(const Version&);
 };
+
+/*
+主要作用：
+1.Recovery。根据MANIFEST文件还原每个记录的Version，然后记录到VersionSet中。
+2.LogAndApply。这个函数主要是当一个Version结束时，将这个Version所做的修改(VersionEdit里)保存到一个新的Version中(VersionSet以后就使用这个Version了)，然后持久化到MANIFEST文件中(WriteSnapshot或者直接进行log record)。
+3.PickCompaction。生成一个Compaction。
+*/
 
 class VersionSet {
  public:
@@ -228,6 +279,7 @@ class VersionSet {
   // Returns NULL if there is no compaction to be done.
   // Otherwise returns a pointer to a heap-allocated object that
   // describes the compaction.  Caller should delete the result.
+
   Compaction* PickCompaction();
 
   // Return a compaction object for compacting the range [begin,end] in
@@ -306,13 +358,25 @@ class VersionSet {
   uint64_t prev_log_number_;  // 0 or backing store for memtable being compacted
 
   // Opened lazily
+  //manifest文件
   WritableFile* descriptor_file_;
+  
+  //将Version_edit写进manifest
   log::Writer* descriptor_log_;
+  
+  // 环形双向链表的表头
   Version dummy_versions_;  // Head of circular doubly-linked list of versions.
+  
+  //当前版本界定 == dummy_versions_.prev_
   Version* current_;        // == dummy_versions_.prev_
 
   // Per-level key at which the next compaction at that level should start.
   // Either an empty string, or a valid InternalKey.
+  /*
+  使用compact_pointer_来保证compact以比较均匀的方式进行，而不是只进行这个level中的某一固定部分。例如，如果不
+  使用compact_pointer_的话，我们可能在size_compact中总是以第一个文件进行compact，这样level+1层中的后半部分文件就不会得到同样多的进行compact的机会。
+  每层都有一个compact pointer用于指示下次从哪里开始compact,以用于实现循环compact
+  */
   std::string compact_pointer_[config::kNumLevels];
 
   // No copying allowed

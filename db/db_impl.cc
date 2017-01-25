@@ -530,6 +530,11 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   return s;
 }
 
+/*
+Minor Compaction是说，用户输入的key－value足够多了，需要讲memtable转成immutable memtable，
+然后讲immutable memtable dump成 sstable，而这种情况下，sstable文件多了一个，而能属于level0，
+也能属于level1或者level2。这种情况下，我们成为version发生了变化，需要升级版本
+*/
 void DBImpl::CompactMemTable() {
   mutex_.AssertHeld();
   assert(imm_ != NULL);
@@ -689,6 +694,12 @@ void DBImpl::BackgroundCompaction() {
     CompactMemTable();
     return;
   }
+
+  /*
+  Major Compaction 要复杂一些，它牵扯到两个Level的文件。它会计算出重叠部分的文件，然后归并排序，
+  merge成新的sstable文件，一旦新的文件merge完毕，老的文件也就没啥用了。因此对于这种Compaction
+  除了new_files_还有deleted_files_（当然还有compaction_pointers_）
+  */
 
   Compaction* c;
   bool is_manual = (manual_compaction_ != NULL);

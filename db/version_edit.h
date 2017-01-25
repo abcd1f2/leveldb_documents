@@ -14,6 +14,10 @@ namespace leveldb {
 
 class VersionSet;
 
+/*
+    注意sstable文件的名字是 number.sst 如11423.sst这种格式，只要一个number就可以表示该SSTable文件的名字，
+    除此外还存放着该SSTable文件的长度。因为SSTable文件里面的键值是有序的，因此，最大的key和最小的key就足矣描述key的范围
+*/
 struct FileMetaData {
   int refs;
   int allowed_seeks;          // Seeks allowed until compaction
@@ -84,6 +88,7 @@ class VersionEdit {
  private:
   friend class VersionSet;
 
+  //定义删除文件集合，<层次，文件编号>
   typedef std::set< std::pair<int, uint64_t> > DeletedFileSet;
 
   std::string comparator_;
@@ -97,8 +102,11 @@ class VersionEdit {
   bool has_next_file_number_;
   bool has_last_sequence_;
 
+  //压缩点<层次，InternalKey键>
   std::vector< std::pair<int, InternalKey> > compact_pointers_;
+  //删除文件集合
   DeletedFileSet deleted_files_;
+  //新添加的文件集合
   std::vector< std::pair<int, FileMetaData> > new_files_;
 };
 
