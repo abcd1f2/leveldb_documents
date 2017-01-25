@@ -18,6 +18,36 @@
 #include "util/coding.h"
 #include "util/logging.h"
 
+/*
+    MANIFEST文件损坏后如何恢复leveldb
+
+    为什么MANIFEST损坏或者丢失之后，依然可以恢复出来？LevelDB如何做到。
+    对于LevelDB而言，修复过程如下：
+        1.首先处理log，这些还未来得及写入的记录，写入新的.sst文件
+        2.扫描所有的sst文件，生成元数据信息：包括number filesize， 最小key，最大key
+        3.根据这些元数据信息，将生成新的MANIFEST文件。
+    第三步如何生成新的MANIFEST？ 因为sstable文件是分level的，但是很不幸，我们无法从名字上判断出来文件属于哪个level。
+        第三步处理的原则是，既然我分不出来，我就认为所有的sstale文件都属于level 0，因为level 0是允许重叠的，因此并没有违法基本的准则。
+
+    当修复之后，第一次Open LevelDB的时候，很明显level 0 的文件可能远远超过4个文件，因此会Compaction。 
+        又因为所有的文件都在Level 0 这次Compaction无疑是非常沉重的。它会扫描所有的文件，归并排序，产生出level 1文件，进而产生出其他level的文件。
+
+    从上面的处理流程看，如果只有MANIFEST文件丢失，其他文件没有损坏，LevelDB是不会丢失数据的，
+        原因是，LevelDB既然已经无法将所有的数据分到不同的Level，但是数据毕竟没有丢，根据文件的number，完全可以判断出文件的新旧，
+        从而确定不同sstable文件中的重复数据，which是最新的。经过一次比较耗时的归并排序，就可以生成最新的levelDB。
+    
+    上述的方法，从功能的角度看，是正确的，但是效率上不敢恭维。Riak曾经测试过78000个sstable 文件，490G的数据，大家都位于Level 0，
+        归并排序需要花费6 weeks，6周啊，这个耗时让人发疯的。
+    
+    Riak 1.3 版本做了优化，改变了目录结构，对于google 最初版本的LevelDB，所有的文件都在一个目录下，但是Riak 1.3版本引入了子目录，
+        将不同level的sst 文件放入不同的子目录：
+        sst_0
+        sst_1
+        ...
+        sst_6
+    有了这个，重新生成MANIFEST自然就很简单了，同样的78000 sstable文件，Repair过程耗时是分钟级别的
+*/
+
 namespace leveldb {
 
 static const int kTargetFileSize = 2 * 1048576;
@@ -869,6 +899,10 @@ class VersionSet::Builder {
       // File is deleted: do nothing
     } else {
       std::vector<FileMetaData*>* files = &v->files_[level];
+      /*
+          除level0外的任何level （1～6），Version v内的对应层级的文件列表必须是有序的，不能交叉
+          所以此处有判断 level >0,这是因为并不care level0 是否交叉，事实上，它几乎总是交叉的
+      */
       if (level > 0 && !files->empty()) {
         // Must not overlap
           // 如果是大于0层的文件，新添加的文件不能和集合中已存在的文件有交集
@@ -975,6 +1009,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   // a temporary file that contains a snapshot of the current version.
   std::string new_manifest_file;
   Status s;
+  // descriptor_log_ == NULL 对应的是不延用老的MANIFEST文件
   if (descriptor_log_ == NULL) {
     // No reason to unlock *mu here since we only hit this path in the
     // first call to LogAndApply (when opening the database).
@@ -985,10 +1020,16 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     if (s.ok()) {
       descriptor_log_ = new log::Writer(descriptor_file_);
       //这个函数添加了一个edit，有comparator，但是其它的为false，因为是新建。 
+      // 当前的版本情况打个快照，作为新MANIFEST的新起点
       s = WriteSnapshot(descriptor_log_);
     }
   }
 
+  /*
+      如果不延用老的MANIFEST文件，会生成一个空的MANIFEST文件，同时调用WriteSnapShot将当前版本情况作为起点记录到MANIFEST文件。
+      这种情况下，MANIFEST文件的大小会大大减少，就像自我介绍，完全可以自己出生起开始介绍起，完全不必从盘古开天辟地介绍起。
+      可惜的是，只要DB不关闭，MANIFEST文件就没有机会整理。因此对于ceph-mon这种daemon进程，MANIFEST文件的大小会一直增长，除非重启ceph-mon才有机会整理。
+  */
   // Unlock during expensive MANIFEST log write
   {
     mu->Unlock();
@@ -996,8 +1037,11 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     // Write new record to MANIFEST log
     if (s.ok()) {
       std::string record;
+      //先调用VersionEdit的 EncodeTo方法，序列化成字符串
+      //将当前VersionEdit Encode，作为记录，写入MANIFEST
       edit->EncodeTo(&record);
       //现在又添加了一个edit，没有comparator，但是其它的为true 
+      //注意，descriptor_log_是log文件
       s = descriptor_log_->AddRecord(record);
       if (s.ok()) {
         s = descriptor_file_->Sync();
@@ -1019,7 +1063,14 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
 
   // Install the new version
   if (s.ok()) {
+      /*
+            新的版本已经生成(通过current_和VersionEdit)， VersionEdit也已经写入MANIFEST，
+            此时可以将v设置成current_, 同时将最新的version v链入VersionSet的双向链表
+
+            current_版本的更替时机一定要注意到，LogAndApply生成新版本之后，同时将VersionEdit记录到MANIFEST文件之后
+      */
     AppendVersion(v);
+
     log_number_ = edit->log_number_;
     prev_log_number_ = edit->prev_log_number_;
   } else {
@@ -1043,6 +1094,9 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     3.调用builder.Apply方法，将editcompaction点，增加文件集合，删除文件集合放进builder中，并从将edit内各个文件编号赋值给Version_set相应的变量；
     4.新建一个版本v，将builder中信息应用到这个版本中，然后再将这个版本添加进版本链表中，并设置为当前版本。
     5.最后更新Version_set内的文件编号。
+
+    回放完毕，生成了一个最终版的Verison v，Finalize之后，调用了AppendVersion，这个函数很有意思，
+    事实上，LogAndApply讲VersionEdit写入MANIFEST文件之后，也调用了AppendVersion
 */
 Status VersionSet::Recover(bool *save_manifest) {
   struct LogReporter : public log::Reader::Reporter {
@@ -1064,6 +1118,7 @@ Status VersionSet::Recover(bool *save_manifest) {
   //去掉\n  
   current.resize(current.size() - 1);
 
+  //CURRENT文件记录着MANIFEST的文件名字，名字为MANIFEST-number
   std::string dscname = dbname_ + "/" + current;
   SequentialFile* file;
   s = env_->NewSequentialFile(dscname, &file);
@@ -1102,7 +1157,8 @@ Status VersionSet::Recover(bool *save_manifest) {
       }
 
       if (s.ok()) {
-        // Apply中的levels_[level].added_files其实就是sst文件  
+        // Apply中的levels_[level].added_files其实就是sst文件 
+        //按照次序，将Verison的变化量层层回放，最终会得到最终版本的Version
         builder.Apply(&edit);
       }
 
@@ -1152,9 +1208,13 @@ Status VersionSet::Recover(bool *save_manifest) {
   // versions_中添加该version  
   if (s.ok()) {
     Version* v = new Version(this);
+    // 通过回放所有的VersionEdit，得到最终版本的Version，存入v
     builder.SaveTo(v);
+    
     // Install recovered version
     Finalize(v);
+
+    // AppendVersion将版本v放入VersionSet集合，同时设置curret_等于v
     AppendVersion(v);
     manifest_file_number_ = next_file;
     next_file_number_ = next_file + 1;
@@ -1173,6 +1233,9 @@ Status VersionSet::Recover(bool *save_manifest) {
   return s;
 }
 
+/*
+    
+*/
 bool VersionSet::ReuseManifest(const std::string& dscname,
                                const std::string& dscbase) {
   if (!options_->reuse_logs) {
@@ -1181,6 +1244,15 @@ bool VersionSet::ReuseManifest(const std::string& dscname,
   FileType manifest_type;
   uint64_t manifest_number;
   uint64_t manifest_size;
+
+  /*
+    如果老的MANIFEST文件太大了，就不在延用，return false
+    延用还是不延用的关键在如下语句:
+
+    如果dscriptor_log_ 为NULL，当情况有变，发生了版本的跃升，有VersionEdit需要写入的MANIFEST的时候，
+    会首先判断descriptor_log_是否为NULL，如果为NULL，表示不要在延用老的MANIFEST了，要另起炉灶
+    所谓另起炉灶，即起一个空的MANIFEST，先要记下版本的Snapshot，然后将VersionEdit追加写入
+  */
   if (!ParseFileName(dscbase, &manifest_number, &manifest_type) ||
       manifest_type != kDescriptorFile ||
       !env_->GetFileSize(dscname, &manifest_size).ok() ||
@@ -1198,6 +1270,15 @@ bool VersionSet::ReuseManifest(const std::string& dscname,
     return false;
   }
 
+  /*
+      这部分逻辑要和LogAndApply对照看：延用老的MANIFEST，那么就会执行如下的语句：
+      descriptor_log_ = new log::Writer(descriptor_file_, manifest_size);
+      manifest_file_number_ = manifest_number;
+
+      这个语句的结果是，当version发生变化，出现新的VersionEdit的时候，并不会新创建MANIFEST文件，正相反，会追加写入VersionEdit。
+      但是如果MANIFEST文件已经太大了，我们没必要保留全部的历史VersionEdit，我们完全可以以当前版本为基准，打一个SnapShot，
+      后续的变化，以该SnapShot为基准，不停追加新的VersionEdit
+  */
   Log(options_->info_log, "Reusing MANIFEST %s\n", dscname.c_str());
   descriptor_log_ = new log::Writer(descriptor_file_, manifest_size);
   manifest_file_number_ = manifest_number;
@@ -1211,11 +1292,13 @@ void VersionSet::MarkFileNumberUsed(uint64_t number) {
 }
 
 /*
-对level-0使用文件个数策略，因为它的file-size较小。对其它层使用文件大小策略。
- 寻找这个version下一次compation时的最佳level和score
-OPTIMIZE　ME:
-小文件对于leveldb来说并不是一件好事，因为需要一层一层进行遍历才能查找到一个key。
-所以这里不能单纯依靠size和nums来判断，还需要对小文件做一些特别的处理
+    对level-0使用文件个数策略，因为它的file-size较小。对其它层使用文件大小策略。
+     寻找这个version下一次compation时的最佳level和score
+    OPTIMIZE　ME:
+    小文件对于leveldb来说并不是一件好事，因为需要一层一层进行遍历才能查找到一个key。
+    所以这里不能单纯依靠size和nums来判断，还需要对小文件做一些特别的处理
+
+    这个部分是用来帮忙选择下一次Compaction应该从which level 开始。计算部分比较简单，基本就是看该level的文件数目或者所有文件的size 之和是否超过上限
 */
 void VersionSet::Finalize(Version* v) {
   // Precomputed best level for next compaction
@@ -1237,6 +1320,7 @@ void VersionSet::Finalize(Version* v) {
       // setting, or very high compression ratios, or lots of
       // overwrites/deletions).
         //主要还是因为level-0的file_size太小了  
+        //对于level0 而言，如果文件数目超过了config::kL0_CompactionTrigger， 就标记需要Compaction
       score = v->files_[level].size() /
           static_cast<double>(config::kL0_CompactionTrigger);
     } else {
@@ -1466,16 +1550,18 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
 }
 
 /*
-更倾向于使用size_compaction而不是seek_compaction。
-将level-0中有重叠的部分都放入input[0]中
+    更倾向于使用size_compaction而不是seek_compaction。
+    将level-0中有重叠的部分都放入input[0]中
 
-生成Compaction。
-1.根据是size还是seek类型创建一个compaction
-2.根据上一次更新的compact_pointer_[level]寻找第一个大于该key的file
-3.根据start和end在parent中找到覆盖这段范围的files
-  3.1 对level-0特殊对待。因为level-0中的文件可能有重叠，那么采用感染的方式将所有与该file重叠的files全部加入到input_[0]中。
-4.设置input_[1]并优化input_[0](SetupOtherInputs).
+    生成Compaction。
+    1.根据是size还是seek类型创建一个compaction
+    2.根据上一次更新的compact_pointer_[level]寻找第一个大于该key的file
+    3.根据start和end在parent中找到覆盖这段范围的files
+    3.1 对level-0特殊对待。因为level-0中的文件可能有重叠，那么采用感染的方式将所有与该file重叠的files全部加入到input_[0]中。
+    4.设置input_[1]并优化input_[0](SetupOtherInputs).
 
+    Compaction的时候，调用Pick Compaction函数来选择compaction的层级，那时候会先按照Finalize算出来的level进行Compaction。
+    当然了，如果从文件大小和文件个数的角度看，没有任何level需要Compaction，就按照seek次数来决定
 */
 Compaction* VersionSet::PickCompaction() {
   Compaction* c;
@@ -1486,6 +1572,7 @@ Compaction* VersionSet::PickCompaction() {
   const bool size_compaction = (current_->compaction_score_ >= 1);
   const bool seek_compaction = (current_->file_to_compact_ != NULL);
   //size_compaction要优于seek_compaction 
+  //注意注释，优先按照size来选择compaction的层级，选择的依据即按照Finalize函数计算的score
   if (size_compaction) {
     level = current_->compaction_level_;
     assert(level >= 0);
@@ -1542,42 +1629,42 @@ Compaction* VersionSet::PickCompaction() {
 }
 
 /*
-在level和level+1的files选取上，有两个考量：
-1.为了使level跟level+1结合到level+1的时候level+1不能有重合，需要得到level的samllest和largest在level+1中覆盖的files。
-2.当level+1的files确定以后，它可能会扩大这些files(levle和level+1)的range，在compact的size允许的情况下，
+    在level和level+1的files选取上，有两个考量：
+    1.为了使level跟level+1结合到level+1的时候level+1不能有重合，需要得到level的samllest和largest在level+1中覆盖的files。
+    2.当level+1的files确定以后，它可能会扩大这些files(levle和level+1)的range，在compact的size允许的情况下，
     可以反过来扩大level的file的范围。这可以避免在以后的compaction中，level+1新形成的文件加入到这些file的compaction中来。
-3.如果level的files扩展了，那么它的key的range肯定也要扩展的，为了保证1，必须重新计算level+1的files，
+    3.如果level的files扩展了，那么它的key的range肯定也要扩展的，为了保证1，必须重新计算level+1的files，
     源码中当碰到这种情况时直接退出了，但是我觉得可以在2中加一个while循环。
 
-STAGE-GET&OPTIMISE:优化inputs_[0]和给inputs_[1]初始化。
-1.得到input_[0]中key的范围smallest和largest
-2.根据这两个key得到parents中这两个key覆盖的files
-  (这是为了保证parents中files没有重叠。所以需要把这个区间的keys全部包含进来)
-3.由于parent的左右的两个files很可能是开区间(也就是parent的key的range比child还大)，
-  根据0和1的files重新定义smallest和largest。
-  (这是为了简化下一次compact时的工作。因为如果parent与child有重叠的话，下次child进行compact的时候
-  会将这次compact生成的file包含进来，为了避免以后做更多的compact工作，干脆又重新扩大child的file的范围)
-4.找到0和1的最大最小key。找到level中覆盖这个区间的files加入到expand0
-5.如果expand0中的文件数大于input_[0]中的文件数，说明扩展了，重新定义key的区间，得到parent中的files加入expand1
-6.判断expand1是否又扩展了input_[1]。如果不是这样，才扩展。(这样做的理由见注释)
+    STAGE-GET&OPTIMISE:优化inputs_[0]和给inputs_[1]初始化。
+    1.得到input_[0]中key的范围smallest和largest
+    2.根据这两个key得到parents中这两个key覆盖的files
+    (这是为了保证parents中files没有重叠。所以需要把这个区间的keys全部包含进来)
+    3.由于parent的左右的两个files很可能是开区间(也就是parent的key的range比child还大)，
+    根据0和1的files重新定义smallest和largest。
+    (这是为了简化下一次compact时的工作。因为如果parent与child有重叠的话，下次child进行compact的时候
+    会将这次compact生成的file包含进来，为了避免以后做更多的compact工作，干脆又重新扩大child的file的范围)
+    4.找到0和1的最大最小key。找到level中覆盖这个区间的files加入到expand0
+    5.如果expand0中的文件数大于input_[0]中的文件数，说明扩展了，重新定义key的区间，得到parent中的files加入expand1
+    6.判断expand1是否又扩展了input_[1]。如果不是这样，才扩展。(这样做的理由见注释)
 
-STAGE-UPDATE:更新。
-1.根据重新定义的key范围，寻找grandparent中覆盖的files，这会在db_impl.cc中的ShoulStopBefore函数中用到
-2.更新这个level中下次Compact时开始的key:compact_pointer_[level]这会在PickCompaction寻找第一个file时用到
+    STAGE-UPDATE:更新。
+    1.根据重新定义的key范围，寻找grandparent中覆盖的files，这会在db_impl.cc中的ShoulStopBefore函数中用到
+    2.更新这个level中下次Compact时开始的key:compact_pointer_[level]这会在PickCompaction寻找第一个file时用到
 
-OPTIMIZE ME:
-可能出现input[0]只有一个file，而且这个file的元素很少，但是它跨越了上一层的很多files
-这样input[1]中会有很多的files，而进行compact的时候，基本上就是把input[1]的files进行了一下
-复制而已。有没有可能优化一下？
-我觉得可以将这个文件同它的child进行compact，也就是说，当出现这样的文件时，可以暂时不用管它，等它
-的child进行compact的时候自然这个文件就丰满了。如果这个文件处在level-0，那么一开始不去管它，
-等上层丰满了之后，可以进行merge。也就是说，可以在计算expanded1后，
-判断一下expanded1相对于input[1]增加了多少，如果增加得多，表示我们需要做一些无用功来复制文件
-也就是出现了“thin file”。对于这样的文件应该记录并加以向下处理或者延时处理。
-但是，在Compact::ShouldStopBefore函数中，当一个文件的key range与上层覆盖太多时，会自动停止处理
-这样，这一层就有可能出现小文件，我们需要记录这个小文件，并对它进行处理。
-数据的存储难免会出现一些类似抛物线的形状，也就是说一些范围的key出现得很少，但是他们的overlaps却很大
-把这些文件成为thin file。那么merge就不仅要从高度上着手，而且也应该有宽度上的优化。
+    OPTIMIZE ME:
+    可能出现input[0]只有一个file，而且这个file的元素很少，但是它跨越了上一层的很多files
+    这样input[1]中会有很多的files，而进行compact的时候，基本上就是把input[1]的files进行了一下
+    复制而已。有没有可能优化一下？
+    我觉得可以将这个文件同它的child进行compact，也就是说，当出现这样的文件时，可以暂时不用管它，等它
+    的child进行compact的时候自然这个文件就丰满了。如果这个文件处在level-0，那么一开始不去管它，
+    等上层丰满了之后，可以进行merge。也就是说，可以在计算expanded1后，
+    判断一下expanded1相对于input[1]增加了多少，如果增加得多，表示我们需要做一些无用功来复制文件
+    也就是出现了“thin file”。对于这样的文件应该记录并加以向下处理或者延时处理。
+    但是，在Compact::ShouldStopBefore函数中，当一个文件的key range与上层覆盖太多时，会自动停止处理
+    这样，这一层就有可能出现小文件，我们需要记录这个小文件，并对它进行处理。
+    数据的存储难免会出现一些类似抛物线的形状，也就是说一些范围的key出现得很少，但是他们的overlaps却很大
+    把这些文件成为thin file。那么merge就不仅要从高度上着手，而且也应该有宽度上的优化。
 */
 void VersionSet::SetupOtherInputs(Compaction* c) {
   const int level = c->level();
