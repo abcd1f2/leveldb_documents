@@ -36,6 +36,50 @@
 
 namespace leveldb {
 
+/*
+sstable格式:
+    整个文件包括一系列的Block，Block是磁盘io以及内存cache的基本单位，通过Block读写可以均摊每次IO的开销，利用局部性原理。Block的大小是用户可配置的
+    1) Data Blocks：存放kv对，即实际的数据。kv对会按照大小划分成Block，无法保证所有的Block大小一致，
+        但基本接近于配置的Block大小，但是当kv对数据大于该值时，会作为一个Block。Block内部还包括其他的一些元数据，后文会深入介绍。
+    2) Filter Block: Filter用于确定SSTable是否包含一个key，从而在查找该key时，避免磁盘IO。Filter Block用于存储Filter序列化后的结果。
+    3) Meta Index Block: 用于存放元数据，目前只会kv格式存储Filter block的偏移量，key是filter.${FILTER_NAME}，value是filter block在文件的偏移量。
+    4) Index Block: 对Data block的索引，保存了各个Block中最小key，从而确定了Block的key的范围，加速某个key的搜索。
+    5) Footer: 元数据的元数据，其中包含Index Block和Meta Index Block的偏移量。Footer之所以在最后，是因为文件生成时是顺序追加的，
+        而Footer的信息又依赖于之前的所有信息，所以只能在最后。由于包含了元数据，所以读取SSTable时首要的就是加载footer.
+
+    格式详解：
+        为了支持Filter机制，LevelDB为SSTable增加了一个新的Meta Block类型：”filter” Meta Block。如果数据库在打开时，指定了FilterPolicy，
+        metaindex block内将会包含一条记录用来将"filter.<N>"映射到针对该filter meta block的block handle。
+        此处”<N>”代表了由filter policy的Name()方法返回的字符串{!也就是说在metaindex block内将会有一个KeyValue对用来寻址filter summary数据
+        组成的meta block，对于该KeyValue对来说，Key就是"filter.<N>"，value就是filter meta block的handle}。
+
+        Filter Block存储了一系列的filters。对于这些filters来说，filter i包含了以offset落在[ i*base ... (i+1)*base-1 ]的那个block的所有key为输入
+        的FilterPolicy::CreateFilter()函数的输出结果{!因此实际中一个filter可能对应不止一个block，但是肯定是整数个block，一个block不会跨越两个filter，
+        这样可以快速地计算出一个block对应的filter，因为data index block中存储了data block的offset，
+        直接根据offset和base取值就可以计算出该data block对应了第几个filter。只要知道了是第几个filter，根据Filter Block自身的结构，
+        就可以直接访问该filter数据了}。
+
+        目前，base的值是2KB。因此， 比如blocks X和Y的起始位置都是位于[0KB,2KB-1]，X和Y中的所有key将会通过调用FilterPolicy::CreateFilter()转变为一个filter，
+        同时最终计算出的filter将会作为filter block的第一个filter进行存储。
+    
+        通过Filter Block底部的offset数组可以很容易地将一个data block的offset映射到它所对应的filter{!根据前面的解释，给定data block我们很容易得出
+        它对应的是第几个filter。知道了第几个filter，再根据此处的offset数组很容易就计算出filter的offset了，知道了offset再知道size，
+        就可以取出该filter对应的数据了，而size又可以根据下一个filter的offset-当前offset计算得出。这里的offset是指在filter block内的偏移，而不是文件内的。
+        另注意lg(base)存储的是base对2取对数的值，也就是说比如base值为2KB，那么存储的就是lg(2*1024)=11}。
+
+数据结构:
+    BlockHandle: 指向文件中的一个Block，有两个属性Block的偏移量（offset_）和大小（size_）。
+    Footer: 表示SSTable文件的Footer，大小固定
+    这两个结构提供到string的序列化和反序列化的方法
+
+    TableBuilder: 构造SSTable的入口。将一系列的kv对构造成SSTable。
+    BlockBuilder: 构造Block，对添加的kv对进行序列化。
+    FilterBlockBuilder: 构造Filter Block
+    以上便是生成SSTable文件的主要数据结构
+
+
+*/
+
 BlockBuilder::BlockBuilder(const Options* options)
     : options_(options),
       restarts_(),

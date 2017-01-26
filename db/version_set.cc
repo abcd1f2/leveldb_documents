@@ -376,7 +376,7 @@ void Version::ForEachOverlapping(Slice user_key, Slice internal_key,
 }
 
 /*
-得到这个version中的key-value值
+    得到这个version中的key-value值
 */
 Status Version::Get(const ReadOptions& options,
                     const LookupKey& k,

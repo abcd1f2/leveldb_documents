@@ -696,9 +696,9 @@ void DBImpl::BackgroundCompaction() {
   }
 
   /*
-  Major Compaction 要复杂一些，它牵扯到两个Level的文件。它会计算出重叠部分的文件，然后归并排序，
-  merge成新的sstable文件，一旦新的文件merge完毕，老的文件也就没啥用了。因此对于这种Compaction
-  除了new_files_还有deleted_files_（当然还有compaction_pointers_）
+      Major Compaction 要复杂一些，它牵扯到两个Level的文件。它会计算出重叠部分的文件，然后归并排序，
+      merge成新的sstable文件，一旦新的文件merge完毕，老的文件也就没啥用了。因此对于这种Compaction
+      除了new_files_还有deleted_files_（当然还有compaction_pointers_）
   */
 
   Compaction* c;
