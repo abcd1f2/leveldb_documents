@@ -1139,6 +1139,22 @@ int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes() {
   return versions_->MaxNextLevelOverlappingBytes();
 }
 
+/*
+	TableCache增加了Get接口，在该函数中会调用Table的InternalGet。而TableCache的Get接口又会被Version::Get调用。
+	Version::Get又会被DBImpl::Get调用。
+
+	DB在查找某个key时，首先会查找内存中的memtable，如果找不到才会去文件中查找，通过Version::Get遍历所有level下的文件，
+	对于level 0来说可能需要读取多个文件，因此在读取前需要对某level下文件根据创建时间进行排序，优先读取最新创建的文件，
+	在读取某文件时会通过table_cache_->Get读取给定key。TableCache::Get会调用FindTable在cache中查找是否存在对应table的缓存，
+	如果不存在就重新调用Table::Open，然后将其存入cache。之后调用FindTable所得到的table对象的InternalGet，得到对应key的value，
+	并将其保存到Saver结构中，Saver结构定义在/db/version_set.cc中。Table::InternalGet会首先利用filter进行判断该key是否match，
+	如果不match就直接返回，无需读取相应的block，否则才需要进一步读取并判断是否是所查找的key。filter就是通过这样的过程在DB的查找中起到作用的。
+	
+	另TableCache::Get,Table::InternalGet的输入参数k都是internal key，执行filter相关操作时，它会被转换为user_key
+
+	memtable -> imem_ -> Version::Get -> TableCache::Get ->  第1步：FindTable                           -> Table::InternalGet
+															 或第2步：Table::Open -> cache -> FindTable 
+*/
 Status DBImpl::Get(const ReadOptions& options,
                    const Slice& key,
                    std::string* value) {
