@@ -30,6 +30,10 @@ void FilterBlockBuilder::StartBlock(uint64_t block_offset) {
   }
 }
 
+/*
+    当TableBuilder 每次增加一个元素的时候，就会调用
+*/
+
 void FilterBlockBuilder::AddKey(const Slice& key) {
   Slice k = key;
   start_.push_back(keys_.size());

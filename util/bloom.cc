@@ -14,6 +14,18 @@ static uint32_t BloomHash(const Slice& key) {
   return Hash(key.data(), key.size(), 0xbc9f1d34);
 }
 
+/*
+    leveldb搞个全局的Bloom Filter是不现实的，因为无法预知客户到底存放多少key，leveldb可能存放百万千万个key－value pair，
+    也可能存放几百 几千个key－value，因为n不能确定范围，因此位图的大小m，也很难事先确定。
+    如果设置的m过大，势必造成内存浪费，如果设置的m过小，就会造成很大的虚警。
+    leveldb的设计，并不是全局的bloom filter，而是根据局部的bloom filter，每一部分的数据，设计出一个bloom filter，
+    多个bloom filter来完成任务。
+    leveldb中的bloom filter有第二个层面的改进，即采用了下面论文中的算法思想：
+    Less Hashing, Same Performance: Building a Better Bloom Filter (https://www.eecs.harvard.edu/~michaelm/postscripts/rsa2008.pdf)
+    这个论文有兴趣的筒子可以读一下，我简单summary一下论文的思想，为了尽可能的降低虚概率，最优的hash函数个数可能很高，
+    比如需要10个hash函数，这势必带来很多的计算，而且要设计多个不同的hash函数，
+    论文提供了一个思想，用1个hash函数，多次移位和加法，达到多个hash 的结果。
+*/
 class BloomFilterPolicy : public FilterPolicy {
  private:
   size_t bits_per_key_;
@@ -58,6 +70,7 @@ class BloomFilterPolicy : public FilterPolicy {
     // 在过滤器集合最后记录需要k_次哈希
     dst->push_back(static_cast<char>(k_));  // Remember # of probes in filter
     char* array = &(*dst)[init_size];
+    // 外层循环是每一个key值
     for (int i = 0; i < n; i++) {
       // Use double-hashing to generate a sequence of hash values.
       // See analysis in [Kirsch,Mitzenmacher 2006].
@@ -104,6 +117,8 @@ class BloomFilterPolicy : public FilterPolicy {
     uint32_t h = BloomHash(key);
     const uint32_t delta = (h >> 17) | (h << 15);  // Rotate right 17 bits
     for (size_t j = 0; j < k; j++) {
+      
+      // 得到元素在位列bits中的位置
       const uint32_t bitpos = h % bits;
 
       // 只要有一位为0，说明元素肯定不在过滤器集合内
