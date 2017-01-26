@@ -18,6 +18,19 @@ Cache::~Cache() {
 
 namespace {
 
+/*
+cache管理：
+    LRUHandle:  一个数据节点 node
+    HandleTable: 一个hash表
+    LRUCache: 维护有一个双向链表和一个哈希表
+    ShardedLRUCache: 内部有16个LRUCache
+
+    HandleTable优化：        
+        hash表存在一个重要的问题，就是碰撞，有可能多个不同的键值hash之后值相同，解决碰撞的一个重要思路是链表，将hash之后计算的key相同的元素链入同一个表头对应的链表。
+        可是我们并不满意这种速度，LevelDB做了进一步的优化，即及时扩大hash桶的个数，尽可能地不会发生碰撞，
+        提早增加桶的个数来尽可能地保持一个桶后面只有一个元素
+*/
+
 // LRU cache implementation
 
 // An entry is a variable length heap-allocated structure.  Entries
@@ -59,9 +72,14 @@ class HandleTable {
     return *FindPointer(key, hash);
   }
 
+  /*
+    为了提升查找效率，提早增加桶的个数来尽可能地保持一个桶后面只有一个元素，在插入的算法中有如下内容
+    当整个hash表中元素的个数超过 hash表桶的的个数的时候，调用Resize函数，该函数会将桶的个数增加一倍，同时将现有的元素搬迁到合适的桶的后面。
+    正是这种提早扩大桶的个数，良好的hash函数会保证每个桶对应的链表中尽可能的只有1个元素，从这个角度讲，LevelDB使用这种优化后的哈希表，查找的效率为O（1）
+  */
   LRUHandle* Insert(LRUHandle* h) {
     LRUHandle** ptr = FindPointer(h->key(), h->hash);
-    LRUHandle* old = *ptr;
+    LRUHandle* old = *ptr; //老的元素返回，LRUCache会将相同key的老元素释放，详情看LRUCache的Insert函数
     h->next_hash = (old == NULL ? NULL : old->next_hash);
     *ptr = h;
     if (old == NULL) {
@@ -88,9 +106,9 @@ class HandleTable {
  private:
   // The table consists of an array of buckets where each bucket is
   // a linked list of cache entries that hash into the bucket.
-  uint32_t length_;
-  uint32_t elems_;
-  LRUHandle** list_;
+  uint32_t length_;  // 纪录的就是当前hash桶的个数
+  uint32_t elems_; //_维护在整个hash表中一共存放了多少个元素
+  LRUHandle** list_; // 二维指针，每一个指针指向一个桶的表头位置
 
   // Return a pointer to slot that points to a cache entry that
   // matches key/hash.  If there is no such cache entry, return a
@@ -117,7 +135,7 @@ class HandleTable {
       while (h != NULL) {
         LRUHandle* next = h->next_hash;
         uint32_t hash = h->hash;
-        LRUHandle** ptr = &new_list[hash & (new_length - 1)];
+        LRUHandle** ptr = &new_list[hash & (new_length - 1)]; //各个已有的元素重新计算，应该落在哪个桶的链表中
         h->next_hash = *ptr;
         *ptr = h;
         h = next;
@@ -131,6 +149,12 @@ class HandleTable {
   }
 };
 
+/*
+    设计缓存，快速找到位置是一个重要指标，但是毫无疑问，不仅仅只有这一个设计指标。因为使用LRU，当空间不够的时候，需要踢出某些元素的时候，
+    必需能够快速地找到，哪些元素Last Recent Used，作为替换的牺牲品。这个指标哈希表可就爱莫能助了。
+    当然，我们可以讲最近访问时间作为元素的一个字段保存起来，但是我们不得不扫描整个hash表，将访问时间排序才能知道哪个元素更应该被剔除。毫无疑问效率太低。
+    LRUCache不仅需要哈希表来快速查找，还需要链表能够快速插入和删除。LRUCache 维护有两条双向链表
+*/
 // A single shard of sharded cache.
 class LRUCache {
  public:
@@ -167,9 +191,9 @@ class LRUCache {
 
   // Dummy head of LRU list.
   // lru.prev is newest entry, lru.next is oldest entry.
-  LRUHandle lru_;
+  LRUHandle lru_; //double list
 
-  HandleTable table_;
+  HandleTable table_; //hash table
 };
 
 LRUCache::LRUCache()
@@ -191,9 +215,9 @@ LRUCache::~LRUCache() {
 void LRUCache::Unref(LRUHandle* e) {
   assert(e->refs > 0);
   e->refs--;
-  if (e->refs <= 0) {
+  if (e->refs <= 0) { // Deallocate. 没人访问了，可以删除了
     usage_ -= e->charge;
-    (*e->deleter)(e->key(), e->value);
+    (*e->deleter)(e->key(), e->value); //元素的deleter函数，此时回调
     free(e);
   }
 }
@@ -215,6 +239,7 @@ Cache::Handle* LRUCache::Lookup(const Slice& key, uint32_t hash) {
   MutexLock l(&mutex_);
   LRUHandle* e = table_.Lookup(key, hash);
   if (e != NULL) {
+    //使用cache，cache从链表中删除，添加到lru_的pre，lru的prev是最新的
     e->refs++;
     LRU_Remove(e);
     LRU_Append(e);
@@ -250,6 +275,7 @@ Cache::Handle* LRUCache::Insert(
     Unref(old);
   }
 
+  //超过容量，开始循环删除
   while (usage_ > capacity_ && lru_.next != &lru_) {
     LRUHandle* old = lru_.next;
     LRU_Remove(old);

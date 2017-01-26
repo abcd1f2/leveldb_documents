@@ -552,12 +552,18 @@ bool Version::OverlapInLevel(int level,
 }
 
 /*
-找到可以存放这个memtable的level
-这里的原则是，尽量找到没有重叠的最高level——这是第2个if的意思
-第3个if的意思是说，如果parent里没有重叠，level应该选取parent，
-但是如果两层之间的重叠部分太多的话，下一次compact的概率就会增加
-但是如果在这两层之间加一个“缓冲层”，则会减少compact的工作(毕竟层数越高，文件越大)
-这也是lazy思想的体现。
+    找到可以存放这个memtable的level
+    这里的原则是，尽量找到没有重叠的最高level——这是第2个if的意思
+    第3个if的意思是说，如果parent里没有重叠，level应该选取parent，
+    但是如果两层之间的重叠部分太多的话，下一次compact的概率就会增加
+    但是如果在这两层之间加一个“缓冲层”，则会减少compact的工作(毕竟层数越高，文件越大)
+    这也是lazy思想的体现。
+
+    新产生出来的sstable 并不一定总是处于level 0， 尽管大多数情况下，处于level 0。新创建的出来的sstable文件应该位于那一层呢？ 由PickLevelForMemTableOutput 函数来计算：
+    从策略上要尽量将新compact的文件推至高level，毕竟在level 0 需要控制文件过多，compaction IO和查找都比较耗费，另一方面也不能推至过高level，
+    一定程度上控制查找的次数，而且若某些范围的key更新比较频繁，后续往高层compaction IO消耗也很大。 所以PickLevelForMemTableOutput就是个权衡折中。
+    如果新生成的sstable和Level 0的sstable有交叠，那么新产生的sstable就直接加入level 0，否则根据一定的策略，向上推到Level1 甚至是Level 2，
+    但是最高推到Level2，这里有一个控制参数：kMaxMemCompactLevel。
 */
 int Version::PickLevelForMemTableOutput(
     const Slice& smallest_user_key,
@@ -566,13 +572,15 @@ int Version::PickLevelForMemTableOutput(
   // 如果1.level0里有files的最大和最小key包含它(不一定是包含所有的key)  
   // 例如s = 0， l = 10， 那么file的key可能为，-1， 2， ，4， 9， 11，  
   // 也有可能为：0， 1， 4， 9， 10，相同的key会在DoCompactWork的时候drop掉  
+  // 如果和Level 0中的SSTable文件由重叠，直接返回 level ＝ 0 
   if (!OverlapInLevel(0, &smallest_user_key, &largest_user_key)) {
     // Push to next level if there is no overlap in next level,
     // and the #bytes overlapping in the level after that are limited.
     InternalKey start(smallest_user_key, kMaxSequenceNumber, kValueTypeForSeek);
     InternalKey limit(largest_user_key, 0, static_cast<ValueType>(0));
     std::vector<FileMetaData*> overlaps;
-    while (level < config::kMaxMemCompactLevel) {// level只能是0-kMaxMemCompactLevel(2)之间的数
+    // level只能是0-kMaxMemCompactLevel(2)之间的数 while 循环寻找合适的level层级，最大level为2，不能更大
+    while (level < config::kMaxMemCompactLevel) {
       if (OverlapInLevel(level + 1, &smallest_user_key, &largest_user_key)) {
         // 或者2.它的parent里有重叠  
         break;

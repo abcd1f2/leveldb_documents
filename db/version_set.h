@@ -300,6 +300,11 @@ class VersionSet {
   Iterator* MakeInputIterator(Compaction* c);
 
   // Returns true iff some level needs a compaction.
+  /*
+        如果某一层级文件的个数太多（指的是level0）， 或者某一层级的文件总大小太大，超过门限值，则设置v->compaction_score为一个大于1的数。
+        我们看下在什么情况下会重新计算compaction_score_。在Finalize函数中，会遍历各个level的文件数目和该level所有文件的总大小，给各个level打个分，
+        如果没有一个level的分数是大于等于1，表示任何一个层级都不需要Compaction，但是如果存在某个或者某几个层级的score大于等于1，选择分最高的那个level
+  */
   bool NeedsCompaction() const {
     Version* v = current_;
     return (v->compaction_score_ >= 1) || (v->file_to_compact_ != NULL);

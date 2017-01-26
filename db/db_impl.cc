@@ -484,6 +484,14 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   return status;
 }
 
+/*
+    1.BuildTable: 
+        将memtable内容dump到对应的sstable文件
+    2.PickLevelForMemTableOutput:
+        根据最小和最大key计算新生成的sstable应该属于which level
+    3.edit->AddFile:
+        versionEdit中记录新的成员
+*/
 Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
                                 Version* base) {
   mutex_.AssertHeld();
@@ -531,9 +539,12 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
 }
 
 /*
-Minor Compaction是说，用户输入的key－value足够多了，需要讲memtable转成immutable memtable，
-然后讲immutable memtable dump成 sstable，而这种情况下，sstable文件多了一个，而能属于level0，
-也能属于level1或者level2。这种情况下，我们成为version发生了变化，需要升级版本
+    Minor Compaction是说，用户输入的key－value足够多了，需要讲memtable转成immutable memtable，
+    然后讲immutable memtable dump成 sstable，而这种情况下，sstable文件多了一个，而能属于level0，
+    也能属于level1或者level2。这种情况下，我们成为version发生了变化，需要升级版本
+
+    1.WriteLevel0Table
+    2.LogAndApply
 */
 void DBImpl::CompactMemTable() {
   mutex_.AssertHeld();
@@ -657,6 +668,18 @@ void DBImpl::MaybeScheduleCompaction() {
   } else if (imm_ == NULL &&
              manual_compaction_ == NULL &&
              !versions_->NeedsCompaction()) {
+    /*
+        防止无限递归，会判断需不需要再次Compaction，如果不需要就返回了
+        imm_ == NULL表示没有Immutable MemTable需要dump成SST
+        manual_compaction_ == NULL 表示不是手动调用DBImpl::CompactRange，人工触发
+        versions_->NeedsCompaction 来 判断是是否需要进一步发起Compaction
+
+        这段代码反应了一些需要发起Compction的条件，一下三个条件满足一个即可发起Compaction：
+        imm_ != NULL 表示需要将Memtable dump成SSTable，发起Minor Compaction
+        manual_compaction_ != NULL 表示手动发起Compaction
+        versions_->NeedsCompaction函数返回True
+    */
+
     // No work to be done
   } else {
     bg_compaction_scheduled_ = true;

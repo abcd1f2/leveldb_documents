@@ -34,6 +34,7 @@ Status BuildTable(const std::string& dbname,
 
     TableBuilder* builder = new TableBuilder(options, file);
     meta->smallest.DecodeFrom(iter->key());
+    //遍历MemTable的跳表，按照key的大小，有序地插入SSTable
     for (; iter->Valid(); iter->Next()) {
       Slice key = iter->key();
       meta->largest.DecodeFrom(key);
@@ -41,6 +42,7 @@ Status BuildTable(const std::string& dbname,
     }
 
     // Finish and check for builder errors
+    //所有的key value pair插入后，调用Finish，按照SSTable中讲的那样，加上metaindex block， index block和footer
     if (s.ok()) {
       s = builder->Finish();
       if (s.ok()) {
@@ -64,6 +66,7 @@ Status BuildTable(const std::string& dbname,
 
     if (s.ok()) {
       // Verify that the table is usable
+        //验证文件可用
       Iterator* it = table_cache->NewIterator(ReadOptions(),
                                               meta->number,
                                               meta->file_size);
