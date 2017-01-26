@@ -60,6 +60,10 @@ size_t BlockBuilder::CurrentSizeEstimate() const {
           sizeof(uint32_t));                      // Restart array length
 }
 
+/*
+    当当前data_block中的内容足够多，预计大于预设的门限值的时候，就开始flush，
+    所谓data block的Flush就是将所有的重启点指针记录下来，并且记录重启点的个数
+*/
 Slice BlockBuilder::Finish() {
   // Append restart array
   for (size_t i = 0; i < restarts_.size(); i++) {
@@ -70,6 +74,18 @@ Slice BlockBuilder::Finish() {
   return Slice(buffer_);
 }
 
+/*
+    注意，很多key可能有重复的字节，比如“hellokitty”和”helloworld“是两个相邻的key，由于key中有公共的部分“hello”，
+        因此，如果将公共的部分提取，可以有效的节省存储空间。
+    处于这种考虑，LevelDb采用了前缀压缩(prefix-compressed)，由于LevelDb中key是按序排列的，这可以显著的减少空间占用。
+        另外，每间隔16个keys(目前版本中options_->block_restart_interval默认为16)，
+        LevelDb就取消使用前缀压缩，而是存储整个key(我们把存储整个key的点叫做重启点)
+    example:
+        abcd123 1111111111
+        abcd456 2222222222
+        4 3 10 456 0123456789
+        shared_length + non_shared_length + value_length + non_shared_value + value
+*/
 void BlockBuilder::Add(const Slice& key, const Slice& value) {
   Slice last_key_piece(last_key_);
   assert(!finished_);
@@ -85,6 +101,7 @@ void BlockBuilder::Add(const Slice& key, const Slice& value) {
     }
   } else {
     // Restart compression
+      //新的重启点，记录下位置
     restarts_.push_back(buffer_.size());
     counter_ = 0;
   }

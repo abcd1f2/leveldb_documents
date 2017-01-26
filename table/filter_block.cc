@@ -19,6 +19,9 @@ FilterBlockBuilder::FilterBlockBuilder(const FilterPolicy* policy)
     : policy_(policy) {
 }
 
+/*
+    这个函数负责一轮计算Bloom Filter的位图，这个函数触发的时机是Flush函数，而Flush的时机是预测Data Block的size超过options.block_size
+*/
 void FilterBlockBuilder::StartBlock(uint64_t block_offset) {
   uint64_t filter_index = (block_offset / kFilterBase);
   assert(filter_index >= filter_offsets_.size());

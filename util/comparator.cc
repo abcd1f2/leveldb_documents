@@ -26,6 +26,23 @@ class BytewiseComparatorImpl : public Comparator {
     return a.compare(b);
   }
 
+  /*
+        TableBuild中Add函数的这段逻辑就是用来计算分割key，并插入key-value pair到index block。关键函数在
+        r->options.comparator->FindShortestSeparator(&r->last_key, key);
+        FindShortestSeparator的声明如下： FindShortestSeparator(std::string *start, const Slice& limit)
+        
+        该函数的的作用是，如果start<limit,就把start修改为*start和limit的共同前缀后面多一个字符加1。很难理解用例子来说明下：
+            *start:    helloleveldb        上一个data block的最后一个key
+            limit:     helloworld          下一个data block的第一个key
+            由于 *start < limit, 所以调用 FindShortSuccessor(start, limit)之后，start变成：
+            hellom (保留前缀，第一个不相同的字符+1)
+        
+        这里面有一个特例，即上一个data block的最后一个key是下一个data block第一个可以 的子串，怎么处理?
+            *start:    hello               上一个data block的最后一个key
+            limit:     helloworld          下一个data block的第一个key
+            由于 *start < limit, 所以调用 FindShortSuccessor(start, limit)之后，start变成：
+            hello (保留前缀，第一个不相同的字符+1)
+  */
   virtual void FindShortestSeparator(
       std::string* start,
       const Slice& limit) const {
