@@ -1631,6 +1631,7 @@ Compaction* VersionSet::PickCompaction() {
     assert(!c->inputs_[0].empty());
   }
 
+  //出了最后的SetupOtherInputs函数，负责计算Level n＋1的参战文件，其他的语句都是用来计算level n的参战文件。
   SetupOtherInputs(c);
 
   return c;
@@ -1677,9 +1678,11 @@ Compaction* VersionSet::PickCompaction() {
 void VersionSet::SetupOtherInputs(Compaction* c) {
   const int level = c->level();
   InternalKey smallest, largest;
+  //获取level n所有参战文件的最小key和最大key
   GetRange(c->inputs_[0], &smallest, &largest);
 
   // 找到它的parents中在smallest和largest范围的overlapps
+  //根据最小key和最大 key，计算level n＋1的文件中于该范围有重叠的文件，放入c->inputs_[1]中
   current_->GetOverlappingInputs(level+1, &smallest, &largest, &c->inputs_[1]);
 
   // Get entire range covered by compaction
@@ -1696,6 +1699,9 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
 
   // See if we can grow the number of inputs in "level" without
   // changing the number of "level+1" files we pick up.
+  /*
+        根据上图中的 level n中的参战文件A 计算出了 level n＋1 中的B C D需要参战，这是没有任何问题的，但是 由于B C D的加入，key的范围扩大了，又一个问题是 level n层的E需不需要参战？
+  */
   if (!c->inputs_[1].empty()) {
     std::vector<FileMetaData*> expanded0;
     current_->GetOverlappingInputs(level, &all_start, &all_limit, &expanded0);
