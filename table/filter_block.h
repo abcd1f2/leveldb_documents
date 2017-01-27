@@ -20,6 +20,17 @@ namespace leveldb {
 
 class FilterPolicy;
 
+/*
+	FilterBlock内部不像Block有复杂的(key,value)格式，其只有一个字符串。该字符串的内部结构如下图。
+	filterblock保存多个filter string，每个filter string针对一段block，间隔为2^base_lg_，保存在末尾，
+	默认值为2KB，也就是说，filter block每隔2kb block offset的key生成一个filter string，offset_array_
+	指出了这些filter string的偏移。过滤时，一般先通过data index block获取key的大致block offset，
+	再通过filter string的offset_array_获取该block offset的filter string，再进行过滤。生成时，
+	对同一个block offset范围的数据一起构建filter string。具体代码细节在filter_block.cc/.h中。
+	读写分别用FilterBlockReader与FilterBlockBuilder来封装
+
+*/
+
 // A FilterBlockBuilder is used to construct all of the filters for a
 // particular Table.  It generates a single string which is stored as
 // a special block in the Table.

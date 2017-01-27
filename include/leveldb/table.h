@@ -21,6 +21,27 @@ class TableCache;
 // A Table is a sorted map from strings to strings.  Tables are
 // immutable and persistent.  A Table may be safely accessed from
 // multiple threads without external synchronization.
+
+/*
+	table目录下的主要改动有：
+	新增了filter_block.h，filter_block.cc，内有FilterBlockReader,FilterBlockBuilder用于filter block的读写。
+	FilterBlockBuilder有三个接口StartBlock,AddKey,Finish ,这三个接口调用必须按照如下形式(StartBlock AddKey*)* Finish。
+	StartBlock函数会判断是否需要将在此block之前的那些block的key组成的集合求一次filter，如果之前的block所对应的filter与
+	当前block对应的不是同一个，则GenerateFilter()。AddKey会把key连续存放到一个string中，在GenerateFilter()时会根据keys_
+	和start_构建出一个key的list，然后计算它们对应的summary。最终result_里保存的就是最终的filter block数据。
+	FilterBlockReader功能主要在于根据现有的filter block数据，判断给定的key及其所在block的offset，判断key是否可能命中。
+
+	Table类中新增InternalGet,ReadMeta,ReadFilter函数，同时新增filter, filter_data两个成员变量。
+	在Open()时，会调用ReadMeta函数，该函数会读取metaindex block，并根据” filter.<N>”找到filter meta block的handle，
+	然后调用ReadFilter函数将filter meta block数据读出，并设置filter和filter_data。
+	InternalGet函数，会首先找到key所对应的block handle，这样就得到了该block对应的offset，
+	然后就可以通过filter->KeyMayMatch判断是否需要继续读取，如果不需要就可以直接返回，避免了对data block的读取。
+
+	TableBuilder类中增加filter_block成员变量，在TableBuilder::Add()调用的同时会通过调用AddKey函数更新filter数据，
+	在TableBuilder::Flush()调用时，调用StartBlock函数，在TableBuilder::Finish()调用时，会首先写入filter block数据，
+	此时会调用Finish函数，然后写入metaindex block，然后是index block，最后是footer
+*/
+
 class Table {
  public:
   // Attempt to open the table that is stored in bytes [0..file_size)

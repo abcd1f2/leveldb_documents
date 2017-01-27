@@ -264,6 +264,7 @@ typename SkipList<Key,Comparator>::Node* SkipList<Key,Comparator>::FindGreaterOr
   Node* x = head_;
   int level = GetMaxHeight() - 1;
   while (true) {
+	//从skiplist的最上层开始查找
     Node* next = x->Next(level);
     if (KeyIsAfterNode(key, next)) {
       // Keep searching in this list
