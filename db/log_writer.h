@@ -15,6 +15,13 @@ namespace leveldb {
 class WritableFile;
 
 namespace log {
+/*
+	log文件格式也是分块存储的。跟sstable文件不同的是，一方面sstable是有序存储的，因此为了加速读取，
+	有相关索引，而log文件始终是顺序读写的，不需要定位某个key，因而不需要索引信息。另一方面sstable的
+	data block虽大致按4KB分块，但实际上存储的块大小通常会比4KB大，这主要是因为单条record不会跨block。
+	而log文件中的block则严格保证为一样，默认值为32KB。因此，log文件中的record可能会跨块，为了区分record是否结束，
+	不同的block有不同的类型（kFullType/kFirstType/kMiddleType/kLastType）
+*/
 
 class Writer {
  public:
