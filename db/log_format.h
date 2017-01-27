@@ -11,6 +11,16 @@
 namespace leveldb {
 namespace log {
 
+/*
+好处如下： 
+（1）容错性好。不需要额外的信息来同步。发现出错了，直接跳至下一个block（32K为一个block）。 
+（2）容易切分，适合mapreduce等大数据处理方式。切分时，需按逻辑上的一个Record。 
+（3）对于大记录，也不需要额外的字段来表示其长度。自然的按32k切分了嘛。 
+限制如下： 
+（1）对于小记录，没有pack机制。 
+（2）没有压缩
+*/
+
 enum RecordType {
   // Zero is reserved for preallocated files
   kZeroType = 0,
