@@ -7,6 +7,11 @@
 
 #include <string>
 
+/*
+    Histogram 直方图，提供给性能评测工具使用
+*/
+
+
 namespace leveldb {
 
 class Histogram {
